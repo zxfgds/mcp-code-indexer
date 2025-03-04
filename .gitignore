@@ -1,0 +1,54 @@
+# Python编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE文件
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 日志文件
+*.log
+logs/
+
+# 项目特定文件
+.mcp_project
+.mcp_ignore
+.mcp_index/
+
+# 向量数据库文件
+*.chroma/
+vector_db/
+project_data/
+# 测试覆盖率报告
+.coverage
+htmlcov/
+
+# 临时文件
+tmp/
+temp/
