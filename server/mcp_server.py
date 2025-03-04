@@ -150,24 +150,6 @@ def setup_mcp_server(config, indexer, search_engine, formatter):
                 }
             ),
             Tool(
-                name="extract_documentation",
-                description="提取代码文档和注释",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "文件路径"
-                        },
-                        "language": {
-                            "type": "string",
-                            "description": "编程语言"
-                        }
-                    },
-                    "required": ["file_path"]
-                }
-            ),
-            Tool(
                 name="find_similar_code",
                 description="查找相似代码片段",
                 inputSchema={
@@ -382,7 +364,7 @@ def setup_mcp_server(config, indexer, search_engine, formatter):
                 language = args.get("language", os.path.splitext(args["file_path"])[1][1:])
                 optimizer = indexer.optimizer
                 
-                quality_metrics = optimizer.analyze_code_quality(content, language)
+                quality_metrics = optimizer.analyze_code_quality(content, args["file_path"], language)
                 
                 return [
                     TextContent(
@@ -395,38 +377,6 @@ def setup_mcp_server(config, indexer, search_engine, formatter):
                     TextContent(
                         type="text",
                         text=f"分析代码质量失败: {str(e)}"
-                    )
-                ]
-
-        elif name == "extract_documentation":
-            if "file_path" not in args:
-                return [
-                    TextContent(
-                        type="text",
-                        text="错误：缺少文件路径参数"
-                    )
-                ]
-            
-            try:
-                with open(args["file_path"], 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                language = args.get("language", os.path.splitext(args["file_path"])[1][1:])
-                analyzer = indexer.optimizer.analyzer
-                
-                docs = analyzer.extract_documentation(content, language)
-                
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps(docs, indent=2, ensure_ascii=False)
-                    )
-                ]
-            except Exception as e:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"提取文档失败: {str(e)}"
                     )
                 ]
 
@@ -497,7 +447,7 @@ def setup_mcp_server(config, indexer, search_engine, formatter):
                 language = args.get("language", os.path.splitext(args["file_path"])[1][1:])
                 optimizer = indexer.optimizer
                 
-                metrics = optimizer.get_code_metrics(content, language)
+                metrics = optimizer.get_code_metrics(content, args["file_path"], language)
                 
                 return [
                     TextContent(
@@ -525,10 +475,23 @@ def setup_mcp_server(config, indexer, search_engine, formatter):
             try:
                 dependencies = indexer.optimizer.analyze_project_dependencies(args["project_path"])
                 
+                # 将set类型转换为list，以便JSON序列化
+                def convert_sets_to_lists(obj):
+                    if isinstance(obj, dict):
+                        return {k: convert_sets_to_lists(v) for k, v in obj.items()}
+                    elif isinstance(obj, set):
+                        return list(obj)
+                    elif isinstance(obj, list):
+                        return [convert_sets_to_lists(item) for item in obj]
+                    else:
+                        return obj
+                
+                serializable_dependencies = convert_sets_to_lists(dependencies)
+                
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps(dependencies, indent=2, ensure_ascii=False)
+                        text=json.dumps(serializable_dependencies, indent=2, ensure_ascii=False)
                     )
                 ]
             except Exception as e:

@@ -169,6 +169,10 @@ class CodeIndexer:
         self.vector_db_path = Path(config.get("storage.vector_db_path"))
         self.vector_db_path.mkdir(parents=True, exist_ok=True)
         
+        # 初始化状态存储路径
+        self.status_path = self.vector_db_path / "indexing_status"
+        self.status_path.mkdir(parents=True, exist_ok=True)
+        
         self.chroma_client = chromadb.PersistentClient(
             path=str(self.vector_db_path),
             settings=Settings(anonymized_telemetry=False)
@@ -189,6 +193,9 @@ class CodeIndexer:
         # 索引状态
         self.indexing_status = {}
         self.indexing_lock = threading.Lock()
+        
+        # 从磁盘加载索引状态
+        self._load_indexing_status()
         
         # 并行处理配置
         self.max_workers = os.cpu_count() if self.optimization_options["parallel_processing"] else 1
@@ -232,9 +239,10 @@ class CodeIndexer:
                 if status == IndexingStatus.INDEXING or status == IndexingStatus.UPDATING:
                     return project_id
             
-            # 设置索引状态
+            # 设置索引状态并保存
             status = IndexingStatus.NEW if is_new else IndexingStatus.UPDATING
             self.indexing_status[project_id] = status
+            self._save_indexing_status()
         
         # 启动索引线程
         threading.Thread(
@@ -310,9 +318,10 @@ class CodeIndexer:
             无返回值
         """
         try:
-            # 更新状态
+            # 更新状态并保存
             with self.indexing_lock:
                 self.indexing_status[project_id] = IndexingStatus.INDEXING
+                self._save_indexing_status()
             
             if progress_callback:
                 progress_callback(IndexingStatus.INDEXING, 0.0)
@@ -340,53 +349,83 @@ class CodeIndexer:
             embeddings_batch = []
             metadatas_batch = []
             
+            # 优化线程池配置，根据CPU核心数和文件数量动态调整
+            optimal_workers = min(os.cpu_count() or 4, max(4, len(files) // 10))
+            logging.info(f"使用 {optimal_workers} 个线程处理 {len(files)} 个文件")
+            
+            # 增加批处理大小以减少数据库操作次数
+            batch_size = self.config.get("indexer.batch_size", 32)
+            # 对大型项目使用更大的批处理大小
+            if len(files) > 1000:
+                batch_size = max(batch_size, 64)
+            
             # 使用线程池并行处理文件
-            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-                future_to_file = {executor.submit(self._process_file, file_path): file_path for file_path in files}
+            with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                # 分批提交任务，避免一次性创建过多线程
+                batch_files = [files[i:i+100] for i in range(0, len(files), 100)]
+                completed_files = 0
                 
-                for future in as_completed(future_to_file):
-                    file_path = future_to_file[future]
-                    try:
-                        file_chunks = future.result()
-                        
-                        if file_chunks:
-                            for chunk in file_chunks:
-                                chunks_batch.append(chunk.content)
-                                ids_batch.append(chunk.get_id())
-                                metadatas_batch.append({
-                                    "file_path": chunk.file_path,
-                                    "start_line": chunk.start_line,
-                                    "end_line": chunk.end_line,
-                                    "language": chunk.language,
-                                    "type": chunk.type,
-                                    "project_id": project_id,
-                                    "chunk_data": json.dumps(chunk.to_dict())
-                                })
+                for file_batch in batch_files:
+                    future_to_file = {executor.submit(self._process_file, file_path): file_path for file_path in file_batch}
+                    
+                    for future in as_completed(future_to_file):
+                        file_path = future_to_file[future]
+                        try:
+                            file_chunks = future.result()
                             
-                            # 当达到批处理大小时，生成嵌入并添加到数据库
-                            if len(chunks_batch) >= batch_size:
-                                embeddings = self.embedding_model.encode(chunks_batch).tolist()
-                                embeddings_batch.extend(embeddings)
+                            if file_chunks:
+                                for chunk in file_chunks:
+                                    chunks_batch.append(chunk.content)
+                                    ids_batch.append(chunk.get_id())
+                                    metadatas_batch.append({
+                                        "file_path": chunk.file_path,
+                                        "start_line": chunk.start_line,
+                                        "end_line": chunk.end_line,
+                                        "language": chunk.language,
+                                        "type": chunk.type,
+                                        "project_id": project_id,
+                                        "chunk_data": json.dumps(chunk.to_dict())
+                                    })
                                 
-                                collection.add(
-                                    documents=chunks_batch,
-                                    embeddings=embeddings_batch,
-                                    metadatas=metadatas_batch,
-                                    ids=ids_batch
-                                )
-                                
-                                chunks_batch = []
-                                ids_batch = []
-                                embeddings_batch = []
-                                metadatas_batch = []
-                        
-                        processed_files += 1
-                        if progress_callback:
-                            progress = 0.1 + (processed_files / total_files) * 0.8
-                            progress_callback(IndexingStatus.INDEXING, progress)
+                                # 当达到批处理大小时，生成嵌入并添加到数据库
+                                if len(chunks_batch) >= batch_size:
+                                    try:
+                                        # 使用更高效的批量编码方法
+                                        embeddings = self.embedding_model.encode(
+                                            chunks_batch,
+                                            batch_size=batch_size,
+                                            show_progress_bar=False,
+                                            convert_to_tensor=False,  # 直接返回numpy数组，避免额外转换
+                                            normalize_embeddings=True  # 预先归一化，提高后续搜索效率
+                                        ).tolist()
+                                        
+                                        embeddings_batch.extend(embeddings)
+                                        
+                                        # 使用批量添加，减少数据库操作次数
+                                        collection.add(
+                                            documents=chunks_batch,
+                                            embeddings=embeddings_batch,
+                                            metadatas=metadatas_batch,
+                                            ids=ids_batch
+                                        )
+                                        
+                                        chunks_batch = []
+                                        ids_batch = []
+                                        embeddings_batch = []
+                                        metadatas_batch = []
+                                    except Exception as e:
+                                        logging.error(f"添加向量数据失败: {str(e)}")
+                                        # 继续处理，不中断索引过程
                             
-                    except:
-                        pass
+                            completed_files += 1
+                            if progress_callback:
+                                progress = 0.1 + (completed_files / total_files) * 0.8
+                                progress_callback(IndexingStatus.INDEXING, progress)
+                                
+                        except Exception as e:
+                            logging.error(f"处理文件失败 {file_path}: {str(e)}")
+                        
+                        # 这里已经在上面的try-except块中处理了进度更新，不需要重复
             
             # 处理剩余的批次
             if chunks_batch:
@@ -403,17 +442,19 @@ class CodeIndexer:
             # 保存索引元数据
             self._save_index_metadata(project_id, project_path, total_files)
             
-            # 更新状态
+            # 更新状态并保存
             with self.indexing_lock:
                 self.indexing_status[project_id] = IndexingStatus.COMPLETED
+                self._save_indexing_status()
             
             if progress_callback:
                 progress_callback(IndexingStatus.COMPLETED, 1.0)
             
         except:
-            # 更新状态
+            # 更新状态并保存
             with self.indexing_lock:
                 self.indexing_status[project_id] = IndexingStatus.FAILED
+                self._save_indexing_status()
             
             if progress_callback:
                 progress_callback(IndexingStatus.FAILED, 0.0)
@@ -698,6 +739,38 @@ class CodeIndexer:
         except:
             pass
     
+    def _load_indexing_status(self) -> None:
+        """
+        从磁盘加载索引状态
+        
+        Returns:
+            无返回值
+        """
+        try:
+            status_file = self.status_path / "status.json"
+            if status_file.exists():
+                with open(status_file, 'r', encoding='utf-8') as f:
+                    self.indexing_status = json.load(f)
+                logging.info(f"从磁盘加载了 {len(self.indexing_status)} 个项目的索引状态")
+        except Exception as e:
+            logging.error(f"加载索引状态失败: {str(e)}")
+            self.indexing_status = {}
+    
+    def _save_indexing_status(self) -> None:
+        """
+        将索引状态保存到磁盘
+        
+        Returns:
+            无返回值
+        """
+        try:
+            status_file = self.status_path / "status.json"
+            with open(status_file, 'w', encoding='utf-8') as f:
+                json.dump(self.indexing_status, f, indent=2)
+            logging.info(f"保存了 {len(self.indexing_status)} 个项目的索引状态到磁盘")
+        except Exception as e:
+            logging.error(f"保存索引状态失败: {str(e)}")
+    
     def get_indexing_status(self, project_id: str) -> Tuple[str, float]:
         """
         获取项目索引状态
@@ -714,9 +787,31 @@ class CodeIndexer:
         # 如果已完成，进度为1.0，否则为0.0
         progress = 1.0 if status == IndexingStatus.COMPLETED else 0.0
         
+        # 检查元数据文件是否存在，如果存在且状态为NEW，则更新为COMPLETED
+        metadata_file = self.vector_db_path / f"metadata_{project_id}.json"
+        if metadata_file.exists() and status == IndexingStatus.NEW:
+            try:
+                # 验证向量数据库集合
+                collection_name = f"project_{project_id}"
+                collection = self.chroma_client.get_collection(name=collection_name)
+                if collection.count() > 0:
+                    with self.indexing_lock:
+                        self.indexing_status[project_id] = IndexingStatus.COMPLETED
+                        self._save_indexing_status()
+                    status = IndexingStatus.COMPLETED
+                    progress = 1.0
+            except Exception as e:
+                logging.error(f"验证索引状态失败: {str(e)}")
+        
         return status, progress
     
-    def search(self, project_id: str, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    # 查询缓存
+    _query_cache = {}
+    _cache_lock = threading.Lock()
+    _cache_max_size = 100  # 最大缓存条目数
+    _cache_ttl = 300  # 缓存有效期（秒）
+    
+    def search(self, project_id: str, query: str, limit: int = 10, timeout: int = 30) -> List[Dict[str, Any]]:
         """
         搜索代码
         
@@ -724,48 +819,116 @@ class CodeIndexer:
             project_id: 项目ID
             query: 查询字符串
             limit: 返回结果数量限制
+            timeout: 搜索超时时间（秒）
             
         Returns:
             代码块字典列表
         """
+        # 获取logger
+        logger = logging.getLogger(__name__)
+        
+        # 生成缓存键
+        cache_key = f"{project_id}:{query}:{limit}"
+        
+        # 检查缓存
+        with self._cache_lock:
+            if cache_key in self._query_cache:
+                cache_entry = self._query_cache[cache_key]
+                # 检查缓存是否过期
+                if time.time() - cache_entry['timestamp'] < self._cache_ttl:
+                    logger.info(f"使用缓存结果: {cache_key}")
+                    return cache_entry['results']
+        
         # 加载嵌入模型
         self._load_embedding_model()
         
         collection_name = f"project_{project_id}"
         
         try:
-            collection = self.chroma_client.get_collection(name=collection_name)
-        except:
+            # 设置超时
+            start_time = time.time()
+            
+            # 获取集合
+            try:
+                collection = self.chroma_client.get_collection(name=collection_name)
+            except Exception as e:
+                logger.error(f"获取集合失败: {str(e)}")
+                return []
+            
+            # 检查超时
+            if time.time() - start_time > timeout:
+                logger.warning(f"搜索超时: 获取集合阶段")
+                return []
+            
+            # 生成查询嵌入
+            try:
+                # 使用更高效的编码设置
+                query_embedding = self.embedding_model.encode(
+                    query,
+                    show_progress_bar=False,
+                    convert_to_tensor=False,
+                    normalize_embeddings=True
+                ).tolist()
+            except Exception as e:
+                logger.error(f"生成查询嵌入失败: {str(e)}")
+                return []
+            
+            # 检查超时
+            if time.time() - start_time > timeout:
+                logger.warning(f"搜索超时: 生成嵌入阶段")
+                return []
+            
+            # 执行搜索
+            try:
+                results = collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=limit,
+                    where={"project_id": project_id}
+                )
+            except Exception as e:
+                logger.error(f"执行查询失败: {str(e)}")
+                return []
+            
+            # 检查超时
+            if time.time() - start_time > timeout:
+                logger.warning(f"搜索超时: 执行查询阶段")
+                return []
+            
+            # 处理结果
+            code_chunks = []
+            if results and results['metadatas']:
+                for i, metadata in enumerate(results['metadatas'][0]):
+                    try:
+                        chunk_data = json.loads(metadata.get('chunk_data', '{}'))
+                        chunk = CodeChunk.from_dict(chunk_data)
+                        
+                        # 添加相似度分数
+                        result_dict = chunk.to_dict()
+                        if 'distances' in results and len(results['distances']) > 0:
+                            result_dict['similarity'] = 1.0 - results['distances'][0][i]
+                        
+                        code_chunks.append(result_dict)
+                    except Exception as e:
+                        logger.error(f"处理结果失败: {str(e)}")
+            
+            # 更新缓存
+            with self._cache_lock:
+                # 如果缓存已满，删除最旧的条目
+                if len(self._query_cache) >= self._cache_max_size:
+                    oldest_key = min(self._query_cache.keys(), key=lambda k: self._query_cache[k]['timestamp'])
+                    del self._query_cache[oldest_key]
+                
+                # 添加新的缓存条目
+                self._query_cache[cache_key] = {
+                    'results': code_chunks,
+                    'timestamp': time.time()
+                }
+            
+            return code_chunks
+            
+        except Exception as e:
+            logger.error(f"搜索失败: {str(e)}")
             return []
-        
-        # 生成查询嵌入
-        query_embedding = self.embedding_model.encode(query).tolist()
-        
-        # 执行搜索
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=limit,
-            where={"project_id": project_id}
-        )
-        
-        # 处理结果
-        code_chunks = []
-        if results and results['metadatas']:
-            for i, metadata in enumerate(results['metadatas'][0]):
-                try:
-                    chunk_data = json.loads(metadata.get('chunk_data', '{}'))
-                    chunk = CodeChunk.from_dict(chunk_data)
-                    
-                    # 添加相似度分数
-                    result_dict = chunk.to_dict()
-                    if 'distances' in results and len(results['distances']) > 0:
-                        result_dict['similarity'] = 1.0 - results['distances'][0][i]
-                    
-                    code_chunks.append(result_dict)
-                except:
-                    pass
-        
-        return code_chunks
     
     def delete_project_index(self, project_id: str) -> bool:
         """
